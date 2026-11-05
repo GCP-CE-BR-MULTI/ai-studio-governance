@@ -1,16 +1,30 @@
 import os
 import json
 import base64
+import re
 import functions_framework
 from google.cloud import run_v2
-from google.iam.v1 import iam_policy_pb2
-from google.api_core.exceptions import GoogleAPICallError
+from google.iam.v1 import iam_policy_pb2, policy_pb2
 import google.auth
 from google.auth.transport.requests import Request
 import requests
 
-# Domínio corporativo que terá acesso liberado via IAP
-DEFAULT_DOMAIN = os.environ.get("ALLOWED_DOMAIN", "domain:felipechagas.altostrat.com")
+# Domínio(s) corporativo(s) que terão acesso liberado via IAP (suporta múltiplos separados por vírgula)
+RAW_ALLOWED = os.environ.get("ALLOWED_DOMAIN", "domain:felipechagas.altostrat.com")
+
+def parse_allowed_members(raw_val: str):
+    members = []
+    for item in raw_val.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.startswith("domain:") or item.startswith("user:") or item.startswith("group:"):
+            members.append(item)
+        else:
+            members.append(f"domain:{item}")
+    return members or ["domain:suaempresa.com"]
+
+ALLOWED_MEMBERS = parse_allowed_members(RAW_ALLOWED)
 
 @functions_framework.cloud_event
 def auto_remediate_cloud_run(cloud_event):
@@ -51,40 +65,27 @@ def auto_remediate_cloud_run(cloud_event):
 
         print(f"==> Deploy detectado: Projeto '{project_id}', Serviço '{service_name}', Região '{location}'")
 
-        # 1. Ativa a flag do IAP no Cloud Run e obtém o project number
-        project_number = enable_cloud_run_iap(project_id, location, service_name)
+        # 1. Ativa a flag do IAP no Cloud Run e obtém os dados do serviço
+        svc_data = enable_cloud_run_iap(project_id, location, service_name)
 
-        # 2. Configura IAM do Cloud Run: remove 'allUsers' e garante a Service Account do IAP como invoker
-        enforce_require_authentication(project_id, location, service_name, project_number)
+        # 2. Garante a Service Account do IAP e obtém o project_number com redundância tripla
+        iap_sa, project_number = get_or_create_iap_sa(project_id, svc_data)
 
-        # 3. Garante acesso IAP Web para o domínio corporativo no serviço e no projeto
-        assign_iap_domain_access(project_id, location, service_name, DEFAULT_DOMAIN)
+        # 3. Configura IAM do Cloud Run: remove 'allUsers' e garante a Service Account do IAP como invoker
+        enforce_require_authentication(project_id, location, service_name, iap_sa)
 
-        print(f"==> Sucesso! O serviço '{service_name}' agora está 100% protegido com IAP.")
+        # 4. Garante acesso IAP Web para os membros/domínios corporativos no serviço e no projeto
+        assign_iap_domain_access(project_id, location, service_name, ALLOWED_MEMBERS)
+
+        print(f"==> Sucesso! O serviço '{service_name}' agora está 100% protegido com IAP (SA Invoker: {iap_sa}).")
 
     except Exception as err:
         print(f"[ERRO GERAL] Exceção no processamento do evento: {err}")
 
 
-def get_project_number(project_id: str) -> str:
-    """Obtém o project number via Cloud Resource Manager API."""
-    try:
-        credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-        credentials.refresh(Request())
-        headers = {"Authorization": f"Bearer {credentials.token}"}
-        resp = requests.get(f"https://cloudresourcemanager.googleapis.com/v1/projects/{project_id}", headers=headers)
-        if resp.status_code == 200:
-            return resp.json().get("projectNumber", "")
-        else:
-            print(f"[AVISO] Falha ao obter project number de {project_id}: HTTP {resp.status_code} - {resp.text}")
-    except Exception as e:
-        print(f"[AVISO] Falha ao obter project number de {project_id}: {e}")
-    return ""
-
-
-def enable_cloud_run_iap(project_id: str, location: str, service_name: str) -> str:
-    """Ativa a flag de IAP no Cloud Run através da API REST Knative/Cloud Run e retorna o project number."""
-    project_number = ""
+def enable_cloud_run_iap(project_id: str, location: str, service_name: str) -> dict:
+    """Ativa a flag de IAP no Cloud Run através da API REST Knative e remove bypass de autenticação."""
+    svc_data = {}
     try:
         credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
         credentials.refresh(Request())
@@ -98,12 +99,11 @@ def enable_cloud_run_iap(project_id: str, location: str, service_name: str) -> s
         resp = requests.get(url, headers=headers)
         if resp.status_code != 200:
             print(f"[AVISO] Falha ao consultar serviço para ativar IAP em {location}: {resp.status_code} - {resp.text}")
-            return ""
+            return {}
 
         svc_data = resp.json()
         metadata = svc_data.setdefault("metadata", {})
         annotations = metadata.setdefault("annotations", {})
-        project_number = metadata.get("namespace", "")
 
         # Ativa IAP e remove o bypass de autenticação do AI Studio
         annotations["run.googleapis.com/iap-enabled"] = "true"
@@ -118,20 +118,75 @@ def enable_cloud_run_iap(project_id: str, location: str, service_name: str) -> s
     except Exception as e:
         print(f"[ERRO] Falha ao comunicar com a API do Cloud Run: {e}")
 
-    return project_number
+    return svc_data
 
 
-def enforce_require_authentication(project_id: str, location: str, service_name: str, project_number: str = ""):
-    """Remove acesso público ('allUsers') e concede roles/run.invoker à Service Account do IAP."""
+def get_or_create_iap_sa(project_id: str, svc_data: dict = None) -> tuple:
+    """
+    Retorna (iap_sa_email, project_number).
+    Usa 3 camadas de redundância para provisionar a identidade IAP e descobrir o project number.
+    """
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    credentials.refresh(Request())
+    headers = {"Authorization": f"Bearer {credentials.token}"}
+
+    project_number = ""
+    iap_sa = ""
+
+    # Camada 1: Provisiona/Garante identidade IAP via Service Usage API
+    try:
+        identity_url = f"https://serviceusage.googleapis.com/v1/projects/{project_id}/services/iap.googleapis.com:generateServiceIdentity"
+        resp = requests.post(identity_url, headers=headers)
+        if resp.status_code == 200:
+            iap_email = resp.json().get("email", "")
+            if iap_email:
+                iap_sa = f"serviceAccount:{iap_email}"
+                m = re.search(r"service-(\d+)@", iap_email)
+                if m:
+                    project_number = m.group(1)
+                print(f"[OK] Identidade IAP garantida via Service Usage: {iap_email}")
+        else:
+            print(f"[INFO] Service Usage generateServiceIdentity: HTTP {resp.status_code} - {resp.text}")
+    except Exception as e:
+        print(f"[AVISO] Tentativa Service Usage generateServiceIdentity: {e}")
+
+    # Camada 2: Extrai o project_number direto das URLs nas anotações do Cloud Run
+    if not project_number and svc_data:
+        try:
+            annotations = svc_data.get("metadata", {}).get("annotations", {})
+            urls_str = annotations.get("run.googleapis.com/urls", "")
+            m = re.search(r"-(\d{8,15})\.", str(urls_str))
+            if m:
+                project_number = m.group(1)
+                print(f"[OK] Project number extraído das URLs do Cloud Run: {project_number}")
+        except Exception as e:
+            print(f"[AVISO] Tentativa extração de run.googleapis.com/urls: {e}")
+
+    # Camada 3: Consulta Cloud Resource Manager API
+    if not project_number:
+        try:
+            crm_url = f"https://cloudresourcemanager.googleapis.com/v1/projects/{project_id}"
+            resp = requests.get(crm_url, headers=headers)
+            if resp.status_code == 200:
+                project_number = resp.json().get("projectNumber", "")
+                print(f"[OK] Project number obtido via Cloud Resource Manager: {project_number}")
+            else:
+                print(f"[AVISO] Falha ao obter project number de {project_id}: HTTP {resp.status_code} - {resp.text}")
+        except Exception as e:
+            print(f"[AVISO] Tentativa Cloud Resource Manager: {e}")
+
+    if not iap_sa and project_number:
+        iap_sa = f"serviceAccount:service-{project_number}@gcp-sa-iap.iam.gserviceaccount.com"
+
+    return iap_sa, project_number
+
+
+def enforce_require_authentication(project_id: str, location: str, service_name: str, iap_sa: str):
+    """Remove acesso público ('allUsers') e concede roles/run.invoker exclusivamente à Service Account do IAP."""
     run_client = run_v2.ServicesClient()
     service_path = f"projects/{project_id}/locations/{location}/services/{service_name}"
 
     try:
-        if not project_number or not project_number.isdigit():
-            project_number = get_project_number(project_id)
-
-        iap_sa = f"serviceAccount:service-{project_number}@gcp-sa-iap.iam.gserviceaccount.com" if project_number else ""
-
         req = iam_policy_pb2.GetIamPolicyRequest(resource=service_path)
         policy = run_client.get_iam_policy(request=req)
 
@@ -145,17 +200,16 @@ def enforce_require_authentication(project_id: str, location: str, service_name:
                 invoker_found = True
                 if iap_sa and iap_sa not in filtered:
                     filtered.append(iap_sa)
-            binding.members[:] = filtered
-            if binding.members:
-                new_bindings.append(binding)
+            if filtered:
+                b = policy_pb2.Binding(role=binding.role, members=filtered)
+                new_bindings.append(b)
 
         if not invoker_found and iap_sa:
-            binding_proto = iam_policy_pb2.Binding()
-            binding_proto.role = "roles/run.invoker"
-            binding_proto.members.append(iap_sa)
-            new_bindings.append(binding_proto)
+            b = policy_pb2.Binding(role="roles/run.invoker", members=[iap_sa])
+            new_bindings.append(b)
 
-        policy.bindings[:] = new_bindings
+        del policy.bindings[:]
+        policy.bindings.extend(new_bindings)
         set_req = iam_policy_pb2.SetIamPolicyRequest(resource=service_path, policy=policy)
         run_client.set_iam_policy(request=set_req)
         print(f"[OK] IAM Cloud Run configurado: público removido e IAP SA '{iap_sa}' vinculada como invoker.")
@@ -164,8 +218,8 @@ def enforce_require_authentication(project_id: str, location: str, service_name:
         print(f"[ERRO] Falha ao alterar IAM do Cloud Run: {e}")
 
 
-def assign_iap_domain_access(project_id: str, location: str, service_name: str, member: str):
-    """Garante que o domínio corporativo tenha roles/iap.httpsResourceAccessor no IAP Web do Cloud Run e do Projeto."""
+def assign_iap_domain_access(project_id: str, location: str, service_name: str, members: list):
+    """Garante que os domínios corporativos tenham roles/iap.httpsResourceAccessor no IAP Web do Cloud Run e do Projeto."""
     try:
         credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
         credentials.refresh(Request())
@@ -188,39 +242,38 @@ def assign_iap_domain_access(project_id: str, location: str, service_name: str, 
 
             resp = requests.post(url_get, headers=headers)
             if resp.status_code != 200:
-                print(f"[AVISO] Não foi possível ler política IAP de {target}: {resp.status_code} - {resp.text}")
+                print(f"[AVISO] Não foi possível ler política IAP de {target}: HTTP {resp.status_code} - {resp.text}")
                 continue
 
             policy = resp.json() or {}
             bindings = policy.setdefault("bindings", [])
 
-            role_found = False
-            member_exists = False
-
+            role_binding = None
             for b in bindings:
                 if b.get("role") == role_target:
-                    role_found = True
-                    members_list = b.setdefault("members", [])
-                    if member in members_list:
-                        member_exists = True
-                    else:
-                        members_list.append(member)
+                    role_binding = b
                     break
 
-            if not role_found:
-                bindings.append({
-                    "role": role_target,
-                    "members": [member]
-                })
+            if not role_binding:
+                role_binding = {"role": role_target, "members": []}
+                bindings.append(role_binding)
 
-            if not member_exists:
+            members_list = role_binding.setdefault("members", [])
+            modified = False
+
+            for m in members:
+                if m not in members_list:
+                    members_list.append(m)
+                    modified = True
+
+            if modified:
                 set_resp = requests.post(url_set, headers=headers, json={"policy": policy})
                 if set_resp.status_code in (200, 201):
-                    print(f"[OK] Permissão IAP '{role_target}' concedida para '{member}' em '{target}'.")
+                    print(f"[OK] Permissões IAP '{role_target}' concedidas para {members} em '{target}'.")
                 else:
-                    print(f"[AVISO] Resposta ao atualizar IAP em {target}: {set_resp.status_code} - {set_resp.text}")
+                    print(f"[AVISO] Resposta ao atualizar IAP em {target}: HTTP {set_resp.status_code} - {set_resp.text}")
             else:
-                print(f"[INFO] '{member}' já possui permissão IAP em '{target}'.")
+                print(f"[INFO] Membros {members} já possuem permissão IAP em '{target}'.")
 
     except Exception as e:
         print(f"[ERRO] Falha ao configurar IAP Web IAM: {e}")
