@@ -75,6 +75,8 @@ def get_project_number(project_id: str) -> str:
         resp = requests.get(f"https://cloudresourcemanager.googleapis.com/v1/projects/{project_id}", headers=headers)
         if resp.status_code == 200:
             return resp.json().get("projectNumber", "")
+        else:
+            print(f"[AVISO] Falha ao obter project number de {project_id}: HTTP {resp.status_code} - {resp.text}")
     except Exception as e:
         print(f"[AVISO] Falha ao obter project number de {project_id}: {e}")
     return ""

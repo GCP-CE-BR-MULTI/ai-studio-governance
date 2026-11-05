@@ -75,6 +75,7 @@ ORG_ROLES=(
   "roles/iap.admin"
   "roles/serviceusage.serviceUsageAdmin"
   "roles/resourcemanager.projectIamAdmin"
+  "roles/resourcemanager.viewer"
   "roles/iam.serviceAccountUser"
 )
 
